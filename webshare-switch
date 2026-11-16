@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import getpass
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+class SwitchError(Exception):
+    pass
+
+
+def read_proxy():
+    if not sys.stdin.isatty():
+        raise SwitchError('Open an interactive SSH session (ssh -t) to enter credentials.')
+    value = getpass.getpass('Paste HOST:PORT:USER:PASS (input hidden): ')
+    match = re.fullmatch(r'(\[[^\]]+\]|[^:]+):([0-9]{1,5}):([^:]+):(.+)', value)
+    if not match:
+        raise SwitchError('Expected HOST:PORT:USER:PASS, with brackets around an IPv6 address.')
+    host, port, user, password = match.groups()
+    return {'address': host.strip().removeprefix('[').removesuffix(']'),
+            'port': int(port), 'user': user, 'pass': password}
+
+
+def proxy_exit(proxy):
+    host = proxy['address']
+    port = proxy['port']
+    user = proxy['user']
+    password = proxy['pass']
+    try:
+        address = ipaddress.ip_address(host)
+        if address.version == 6:
+            host = f'[{address}]'
+    except ValueError:
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}', host):
+            raise SwitchError('Use a valid IP address or hostname.') from None
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise SwitchError('Use a port between 1 and 65535.')
+    for credential in (user, password):
+        if not isinstance(credential, str) or not 1 <= len(credential.encode()) <= 255:
+            raise SwitchError('Each proxy credential must be 1 to 255 bytes.')
+        if any(ord(char) < 32 or ord(char) == 127 for char in credential):
+            raise SwitchError('Proxy credentials cannot contain control characters.')
+    # Pass credentials through stdin, where they stay out of the process arguments.
+    auth = json.dumps(f'{user}:{password}', ensure_ascii=False)
+    result = subprocess.run(
+        ['curl', '-q', '--config', '-', '--noproxy', '', '--proxy',
+         f'socks5h://{host}:{port}', '--connect-timeout', '5', '--max-time', '12',
+         '--retry', '1', '--retry-max-time', '14', '-fsS', 'https://api.ipify.org/'],
+        input=f'proxy-user = {auth}\n', text=True, encoding='utf-8', capture_output=True,
+        timeout=28,
+    )
+    if result.returncode:
+        raise SwitchError(f'Proxy check failed (curl exit {result.returncode}). Check its address and credentials.')
+    try:
+        exit_ip = ipaddress.ip_address(result.stdout.strip())
+    except ValueError:
+        raise SwitchError('The proxy check did not return a public IP address.') from None
+    if not exit_ip.is_global:
+        raise SwitchError('The proxy check did not return a public IP address.')
+    return str(exit_ip)
+
+
+def validate_config(xray, path):
+    result = subprocess.run([xray, 'run', '-test', '-format', 'json', '-c', str(path)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    if result.returncode:
+        raise SwitchError('Xray rejected the configuration.')
+
+
+def store_config(directory, data, prefix, suffix):
+    with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, dir=directory, delete=False) as file:
+        path = Path(file.name)
+        try:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+    return path
+
+
+def restart_xray(service):
+    subprocess.run(['systemctl', 'restart', '--', service], check=True, timeout=45)
+    time.sleep(1)
+    subprocess.run(['systemctl', 'is-active', '--quiet', '--', service], check=True, timeout=5)
+
+
+def switch_proxy(args):
+    replacement = None if args.check else read_proxy()
+    path = args.config.resolve(strict=True)
+    with path.with_name(f'.{path.name}.webshare-switch.lock').open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original = path.read_bytes()
+        metadata = path.stat()
+        config = json.loads(original)
+        outbounds = [item for item in config['outbounds'] if item.get('tag') == args.tag]
+        if len(outbounds) != 1 or outbounds[0]['protocol'] != 'socks':
+            raise SwitchError('Could not find one Webshare SOCKS outbound in the Xray config.')
+        settings = outbounds[0]['settings']
+        if replacement is None or all(settings.get(key) == value for key, value in replacement.items()):
+            validate_config(args.xray, path)
+            print(f'Current Webshare exit IP: {proxy_exit(settings)}', flush=True)
+            return
+
+        print('Testing the new Webshare proxy...', flush=True)
+        exit_ip = proxy_exit(replacement)
+        settings.update(replacement)
+        data = (json.dumps(config, indent=2, ensure_ascii=False) + '\n').encode()
+        candidate = store_config(path.parent, data, '.webshare-proxy.', '.json')
+        try:
+            validate_config(args.xray, candidate)
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+            backup = store_config(path.parent, original, f'{path.name}.{timestamp}.', '.bak')
+            os.chown(candidate, metadata.st_uid, metadata.st_gid)
+            os.chmod(candidate, stat.S_IMODE(metadata.st_mode))
+            try:
+                os.replace(candidate, path)
+                restart_xray(args.service)
+            except (OSError, subprocess.SubprocessError, SwitchError, KeyboardInterrupt):
+                try:
+                    restored = store_config(path.parent, original, '.webshare-restore.', '.tmp')
+                    try:
+                        os.chown(restored, metadata.st_uid, metadata.st_gid)
+                        os.chmod(restored, stat.S_IMODE(metadata.st_mode))
+                        os.replace(restored, path)
+                    finally:
+                        restored.unlink(missing_ok=True)
+                    restart_xray(args.service)
+                except (OSError, subprocess.SubprocessError, SwitchError, KeyboardInterrupt):
+                    raise SwitchError(f'Automatic restore could not be verified. Backup: {backup}') from None
+                raise SwitchError(f'Switch failed and the previous configuration was restored. Backup: {backup}') from None
+        finally:
+            candidate.unlink(missing_ok=True)
+        print(f'Webshare switched. Exit IP: {exit_ip}\nPrevious config: {backup}', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Switch the Webshare outbound used by Xray.')
+    parser.add_argument('--check', action='store_true', help='Check the saved proxy and report its exit IP.')
+    parser.add_argument('--config', type=Path, default=Path('/usr/local/etc/xray/config.json'))
+    parser.add_argument('--xray', default='/usr/local/bin/xray')
+    parser.add_argument('--service', default='xray.service')
+    parser.add_argument('--tag', default='webshare')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.exit(1, 'Run this command as root.\n')
+    os.umask(0o077)
+    try:
+        switch_proxy(args)
+    except BlockingIOError:
+        parser.exit(1, 'A Webshare check or switch is already running.\n')
+    except (EOFError, KeyboardInterrupt):
+        parser.exit(1, '\nCancelled.\n')
+    except (OSError, subprocess.SubprocessError, KeyError, TypeError, ValueError, SwitchError) as error:
+        parser.exit(1, f'Error: {error}\n')
+
+
+if __name__ == '__main__':
+    main()
