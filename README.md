@@ -41,6 +41,6 @@ sudo webshare-switch
 
 Switch the Webshare SOCKS5 outbound in an existing systemd-managed Xray installation. The command tests a candidate proxy, validates the new JSON, saves a backup, and restarts Xray. It attempts to restore the previous configuration if the service fails to restart.
 
-Install with `sudo install -m 0755 ./webshare-switch /usr/local/bin/webshare-switch`. Run `sudo webshare-switch` in your SSH client and paste `HOST:PORT:USER:PASS` at the hidden prompt. Use `sudo webshare-switch --check` to check the saved proxy or `webshare-switch --help` for custom paths and tags. Restarting Xray briefly interrupts active connections.
+Install with `sudo install -m 0755 ./webshare-switch /usr/local/bin/webshare-switch`. Run `sudo webshare-switch` in your SSH client and paste `USER:PASS@HOST:PORT` at the prompt (input is shown as you type). Use `sudo webshare-switch --check` to check the saved proxy or `webshare-switch --help` for custom paths and tags. Restarting Xray briefly interrupts active connections.
 
 Released under the MIT License.

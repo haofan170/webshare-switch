@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import fcntl
-import getpass
 import ipaddress
 import json
 import os
@@ -22,11 +21,11 @@ class SwitchError(Exception):
 def read_proxy():
     if not sys.stdin.isatty():
         raise SwitchError('Open an interactive SSH session (ssh -t) to enter credentials.')
-    value = getpass.getpass('Paste HOST:PORT:USER:PASS (input hidden): ')
-    match = re.fullmatch(r'(\[[^\]]+\]|[^:]+):([0-9]{1,5}):([^:]+):(.+)', value)
+    value = input('Paste USER:PASS@HOST:PORT: ')
+    match = re.fullmatch(r'([^:@]+):(.+)@(\[[^\]]+\]|[^:\[\]]+):([0-9]{1,5})', value)
     if not match:
-        raise SwitchError('Expected HOST:PORT:USER:PASS, with brackets around an IPv6 address.')
-    host, port, user, password = match.groups()
+        raise SwitchError('Expected USER:PASS@HOST:PORT, with brackets around an IPv6 address.')
+    user, password, host, port = match.groups()
     return {'address': host.strip().removeprefix('[').removesuffix(']'),
             'port': int(port), 'user': user, 'pass': password}
 
