@@ -30,6 +30,22 @@ def read_proxy():
             'port': int(port), 'user': user, 'pass': password}
 
 
+def curl_exit_ip(extra_args):
+    result = subprocess.run(
+        ['curl', '-q', '--noproxy', '', '--connect-timeout', '5', '--max-time', '12',
+         '--retry', '1', '--retry-max-time', '14', '-fsS', *extra_args, 'https://api.ipify.org/'],
+        text=True, encoding='utf-8', capture_output=True, timeout=28)
+    if result.returncode:
+        raise SwitchError(f'Exit IP check failed (curl exit {result.returncode}).')
+    try:
+        exit_ip = ipaddress.ip_address(result.stdout.strip())
+    except ValueError:
+        raise SwitchError('The exit IP check did not return a public IP address.') from None
+    if not exit_ip.is_global:
+        raise SwitchError('The exit IP check did not return a public IP address.')
+    return str(exit_ip)
+
+
 def proxy_exit(proxy):
     host = proxy['address']
     port = proxy['port']
@@ -89,25 +105,119 @@ def store_config(directory, data, prefix, suffix):
     return path
 
 
+def install_file(source, target, metadata):
+    os.chown(source, metadata.st_uid, metadata.st_gid)
+    os.chmod(source, stat.S_IMODE(metadata.st_mode))
+    os.replace(source, target)
+
+
 def restart_xray(service):
     subprocess.run(['systemctl', 'restart', '--', service], check=True, timeout=45)
     time.sleep(1)
     subprocess.run(['systemctl', 'is-active', '--quiet', '--', service], check=True, timeout=5)
 
 
-def switch_proxy(args):
-    replacement = None if args.check else read_proxy()
+def commit_config(args, path, metadata, config, original):
+    data = (json.dumps(config, indent=2, ensure_ascii=False) + '\n').encode()
+    candidate = store_config(path.parent, data, '.webshare-route.', '.json')
+    try:
+        validate_config(args.xray, candidate)
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+        backup = store_config(path.parent, original, f'{path.name}.{timestamp}.', '.bak')
+        try:
+            install_file(candidate, path, metadata)
+            restart_xray(args.service)
+        except (OSError, subprocess.SubprocessError, SwitchError, KeyboardInterrupt):
+            try:
+                restored = store_config(path.parent, original, '.webshare-restore.', '.tmp')
+                try:
+                    install_file(restored, path, metadata)
+                finally:
+                    restored.unlink(missing_ok=True)
+                restart_xray(args.service)
+            except (OSError, subprocess.SubprocessError, SwitchError, KeyboardInterrupt):
+                raise SwitchError(f'Automatic restore could not be verified. Backup: {backup}') from None
+            raise SwitchError(f'Switch failed and the previous configuration was restored. Backup: {backup}') from None
+    finally:
+        candidate.unlink(missing_ok=True)
+    return backup
+
+
+def webshare_outbound(config, tag):
+    outbounds = [item for item in config['outbounds'] if item.get('tag') == tag]
+    if len(outbounds) != 1 or outbounds[0]['protocol'] != 'socks':
+        raise SwitchError(f'Could not find one SOCKS outbound tagged {tag!r} in the Xray config.')
+    return outbounds[0]
+
+
+def routing_rules(config, tag):
+    return [item for item in config.get('routing', {}).get('rules', [])
+            if item.get('type') == 'field' and item.get('outboundTag') in (tag, 'direct')]
+
+
+def route_mode(config, tag):
+    rules = routing_rules(config, tag)
+    direct = [item for item in rules if item.get('outboundTag') == 'direct']
+    proxied = [item for item in rules if item.get('outboundTag') == tag]
+    if len(rules) != 1 or (len(direct) + len(proxied)) != 1:
+        raise SwitchError(f'Expected exactly one routing rule using outbound {tag!r} or direct.')
+    return 'direct' if direct else tag
+
+
+def report_mode(config, tag):
+    mode = route_mode(config, tag)
+    if mode == 'direct':
+        print(f'Current mode: DIRECT (server IP). Exit IP: {curl_exit_ip([])}', flush=True)
+    else:
+        print(f'Current mode: WEBSHARE. Exit IP: {proxy_exit(webshare_outbound(config, tag)["settings"])}', flush=True)
+
+
+def set_route_mode(args, direct):
     path = args.config.resolve(strict=True)
     with path.with_name(f'.{path.name}.webshare-switch.lock').open('a') as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         original = path.read_bytes()
         metadata = path.stat()
         config = json.loads(original)
-        outbounds = [item for item in config['outbounds'] if item.get('tag') == args.tag]
-        if len(outbounds) != 1 or outbounds[0]['protocol'] != 'socks':
-            raise SwitchError('Could not find one Webshare SOCKS outbound in the Xray config.')
-        settings = outbounds[0]['settings']
-        if replacement is None or all(settings.get(key) == value for key, value in replacement.items()):
+        webshare_outbound(config, args.tag)
+        rules = routing_rules(config, args.tag)
+        if len(rules) != 1:
+            raise SwitchError(f'Expected exactly one routing rule using outbound {args.tag!r} or direct.')
+        rule = rules[0]
+        target = 'direct' if direct else args.tag
+        if rule.get('outboundTag') == target:
+            report_mode(config, args.tag)
+            return
+        if direct:
+            print('Testing direct connectivity from this server...', flush=True)
+            exit_ip = curl_exit_ip([])
+            if not any(item.get('tag') == 'direct' for item in config['outbounds']):
+                config['outbounds'].append({'tag': 'direct', 'protocol': 'freedom'})
+        rule['outboundTag'] = target
+        backup = commit_config(args, path, metadata, config, original)
+        if direct:
+            print(f'Webshare OFF. Traffic now exits via this server. Exit IP: {exit_ip}', flush=True)
+        else:
+            exit_ip = proxy_exit(webshare_outbound(config, args.tag)['settings'])
+            print(f'Webshare ON. Exit IP: {exit_ip}', flush=True)
+        print(f'Previous config: {backup}', flush=True)
+
+
+def switch_proxy(args):
+    path = args.config.resolve(strict=True)
+    with path.with_name(f'.{path.name}.webshare-switch.lock').open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original = path.read_bytes()
+        metadata = path.stat()
+        config = json.loads(original)
+        settings = webshare_outbound(config, args.tag)['settings']
+        if args.check:
+            report_mode(config, args.tag)
+            return
+        if route_mode(config, args.tag) == 'direct':
+            raise SwitchError(f'Webshare is currently OFF. Run with --on to route traffic back through it.')
+        replacement = read_proxy()
+        if all(settings.get(key) == value for key, value in replacement.items()):
             validate_config(args.xray, path)
             print(f'Current Webshare exit IP: {proxy_exit(settings)}', flush=True)
             return
@@ -121,18 +231,14 @@ def switch_proxy(args):
             validate_config(args.xray, candidate)
             timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
             backup = store_config(path.parent, original, f'{path.name}.{timestamp}.', '.bak')
-            os.chown(candidate, metadata.st_uid, metadata.st_gid)
-            os.chmod(candidate, stat.S_IMODE(metadata.st_mode))
             try:
-                os.replace(candidate, path)
+                install_file(candidate, path, metadata)
                 restart_xray(args.service)
             except (OSError, subprocess.SubprocessError, SwitchError, KeyboardInterrupt):
                 try:
                     restored = store_config(path.parent, original, '.webshare-restore.', '.tmp')
                     try:
-                        os.chown(restored, metadata.st_uid, metadata.st_gid)
-                        os.chmod(restored, stat.S_IMODE(metadata.st_mode))
-                        os.replace(restored, path)
+                        install_file(restored, path, metadata)
                     finally:
                         restored.unlink(missing_ok=True)
                     restart_xray(args.service)
@@ -146,7 +252,10 @@ def switch_proxy(args):
 
 def main():
     parser = argparse.ArgumentParser(description='Switch the Webshare outbound used by Xray.')
-    parser.add_argument('--check', action='store_true', help='Check the saved proxy and report its exit IP.')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--check', action='store_true', help='Report the current routing mode and exit IP.')
+    modes.add_argument('--off', action='store_true', help='Route traffic directly via this server (Webshare off).')
+    modes.add_argument('--on', action='store_true', help='Route traffic back through Webshare.')
     parser.add_argument('--config', type=Path, default=Path('/usr/local/etc/xray/config.json'))
     parser.add_argument('--xray', default='/usr/local/bin/xray')
     parser.add_argument('--service', default='xray.service')
@@ -156,7 +265,12 @@ def main():
         parser.exit(1, 'Run this command as root.\n')
     os.umask(0o077)
     try:
-        switch_proxy(args)
+        if args.off:
+            set_route_mode(args, direct=True)
+        elif args.on:
+            set_route_mode(args, direct=False)
+        else:
+            switch_proxy(args)
     except BlockingIOError:
         parser.exit(1, 'A Webshare check or switch is already running.\n')
     except (EOFError, KeyboardInterrupt):
